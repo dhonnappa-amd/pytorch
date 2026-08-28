@@ -9,6 +9,11 @@ on:
   #  tags:
   #    - ciflow/rocm-mi350/*
   workflow_dispatch:
+    inputs:
+      use-no-dind:
+        description: Run the first test shard directly on the experimental no-dind runner.
+        type: boolean
+        default: false
   #schedule:
   #  - cron: 29 8 * * *  # about 1:29am PDT
 
@@ -50,7 +55,7 @@ jobs:
       docker-image-name: ci-image:pytorch-linux-noble-rocm-n-py3
       test-matrix: |
         { include: [
-          { config: "default", shard: 1, num_shards: 6, runner: "${{ needs.get-label-type.outputs.amd-do-label-type }}linux.rocm.gpu.gfx950.1" },
+          { config: "default", shard: 1, num_shards: 6, runner: "${{ inputs.use-no-dind && 'linux.rocm.gpu.gfx950.1-no-dind' || format('{0}linux.rocm.gpu.gfx950.1', needs.get-label-type.outputs.amd-do-label-type) }}" },
           { config: "default", shard: 2, num_shards: 6, runner: "${{ needs.get-label-type.outputs.amd-do-label-type }}linux.rocm.gpu.gfx950.1" },
           { config: "default", shard: 3, num_shards: 6, runner: "${{ needs.get-label-type.outputs.amd-do-label-type }}linux.rocm.gpu.gfx950.1" },
           { config: "default", shard: 4, num_shards: 6, runner: "${{ needs.get-label-type.outputs.amd-do-label-type }}linux.rocm.gpu.gfx950.1" },
