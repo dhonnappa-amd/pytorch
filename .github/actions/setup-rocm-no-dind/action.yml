@@ -1,0 +1,131 @@
+name: Setup ROCm without Docker
+
+description: Install the PyTorch ROCm test environment directly on an Actions runner.
+
+inputs:
+  python-version:
+    description: Python version matching the downloaded PyTorch wheel.
+    required: true
+  rocm-version:
+    description: TheRock ROCm version to install.
+    required: false
+    default: "7.14"
+  therock-index-url:
+    description: Python index containing TheRock ROCm packages.
+    required: false
+    default: "https://repo.amd.com/rocm/whl-multi-arch/"
+
+runs:
+  using: composite
+  steps:
+    - name: Pick the Python environment
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: |
+        set -euxo pipefail
+        # .ci/pytorch/common.sh sources /etc/rocm_env.sh, which puts the runner
+        # image's venv at the front of PATH. Installing torch anywhere else means
+        # test.sh runs against an interpreter that has never seen it, so adopt
+        # whichever environment that file selects.
+        venv=""
+        if [[ -f /etc/rocm_env.sh ]]; then
+          # shellcheck disable=SC1091
+          source /etc/rocm_env.sh
+          image_python="$(command -v python || true)"
+          if [[ -n "${image_python}" ]]; then
+            candidate="$(cd "$(dirname "${image_python}")/.." && pwd)"
+            image_version="$("${image_python}" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+            if [[ -f "${candidate}/pyvenv.cfg" && -w "${candidate}" && "${image_version}" == "${PYTHON_VERSION}" ]]; then
+              venv="${candidate}"
+            fi
+          fi
+        fi
+        echo "PYTORCH_VENV=${venv}" >> "${GITHUB_ENV}"
+        echo "Reusing image environment: ${venv:-none, building one}"
+
+    - name: Install uv
+      shell: bash
+      run: |
+        set -euxo pipefail
+        # System Python on Ubuntu 24.04 is PEP 668 externally managed, so uv is
+        # installed as a standalone binary rather than through pip.
+        if ! command -v uv >/dev/null 2>&1; then
+          uv_bin="${RUNNER_TEMP}/uv-bin"
+          mkdir -p "${uv_bin}"
+          curl -LsSf https://astral.sh/uv/install.sh \
+            | env UV_INSTALL_DIR="${uv_bin}" UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
+          echo "${uv_bin}" >> "${GITHUB_PATH}"
+          export PATH="${uv_bin}:${PATH}"
+        fi
+        uv --version
+
+    - name: Create Python environment
+      if: env.PYTORCH_VENV == ''
+      shell: bash
+      env:
+        PYTHON_VERSION: ${{ inputs.python-version }}
+      run: |
+        set -euxo pipefail
+        if [[ -d /models ]]; then
+          mkdir -p /models/pytorch-no-dind/uv-cache
+          echo "UV_CACHE_DIR=/models/pytorch-no-dind/uv-cache" >> "${GITHUB_ENV}"
+          export UV_CACHE_DIR=/models/pytorch-no-dind/uv-cache
+        fi
+
+        venv="${RUNNER_TEMP}/pytorch-rocm-venv"
+        uv python install "${PYTHON_VERSION}"
+        uv venv --seed --python "${PYTHON_VERSION}" "${venv}"
+
+        echo "PYTORCH_VENV=${venv}" >> "${GITHUB_ENV}"
+        echo "VIRTUAL_ENV=${venv}" >> "${GITHUB_ENV}"
+        echo "${venv}/bin" >> "${GITHUB_PATH}"
+
+    - name: Install ROCm and CI dependencies
+      shell: bash
+      env:
+        ROCM_VERSION: ${{ inputs.rocm-version }}
+        THEROCK_INDEX_URL: ${{ inputs.therock-index-url }}
+      run: |
+        set -euxo pipefail
+        PYTHON="${PYTORCH_VENV}/bin/python"
+
+        rocm_spec="${ROCM_VERSION}"
+        if [[ "${ROCM_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+          rocm_spec="${ROCM_VERSION}.*"
+        fi
+
+        # The runner image already ships the SDK; reinstalling costs several GB.
+        if [[ ! -x "${PYTORCH_VENV}/bin/rocm-sdk" ]]; then
+          uv pip install \
+            --python "${PYTHON}" \
+            --index-url "${THEROCK_INDEX_URL}" \
+            "rocm[libraries,devel,device-all]==${rocm_spec}"
+        fi
+        uv pip install \
+          --python "${PYTHON}" \
+          -r .ci/docker/requirements-ci.txt
+
+    - name: Install pinned Triton wheel
+      shell: bash
+      run: |
+        set -euxo pipefail
+        source "${PYTORCH_VENV}/bin/activate"
+        bash scripts/install_triton_wheel.sh
+
+    - name: Export ROCm environment
+      shell: bash
+      run: |
+        set -euxo pipefail
+        source "${PYTORCH_VENV}/bin/activate"
+        ROCM_HOME="$(rocm-sdk path --root)"
+        ROCM_BIN="$(rocm-sdk path --bin)"
+
+        echo "ROCM_PATH=${ROCM_HOME}" >> "${GITHUB_ENV}"
+        echo "ROCM_HOME=${ROCM_HOME}" >> "${GITHUB_ENV}"
+        echo "LD_LIBRARY_PATH=${ROCM_HOME}/lib:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+        echo "PYTORCH_TEST_WITH_ROCM=1" >> "${GITHUB_ENV}"
+        echo "${ROCM_BIN}" >> "${GITHUB_PATH}"
+
+        test -e /dev/kfd
+        "${ROCM_BIN}/rocminfo"
