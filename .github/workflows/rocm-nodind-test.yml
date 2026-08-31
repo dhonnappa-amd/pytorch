@@ -1,0 +1,382 @@
+# Owner(s): ["module: rocm"]
+#
+# Standalone ROCm test run for no-dind runners.
+#
+# Deliberately self-contained so it works on a fork:
+#   * no `github.repository_owner == 'pytorch'` guards
+#   * no reusable workflows pulled from pytorch/pytorch@main
+#   * no docker pull / docker run / dind sidecar
+#
+# The runner pod has no dockerd. This job installs TheRock ROCm, CI Python
+# deps, Triton, origami, and a torch wheel at job time. Default wheel source
+# is the public S3 zip from pytorch/pytorch trunk-rocm-sandbox (same artifact
+# upstream tests use). Set torch-source=gha-artifact to compile on this runner.
+name: rocm-nodind-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label to dispatch to.
+        type: string
+        default: linux.rocm.gpu.gfx950.1-dhonnappa-no-dind
+      torch-source:
+        description: Where the torch wheel comes from.
+        type: choice
+        options:
+          - upstream-s3
+          - gha-artifact
+          - therock-nightly
+          - wheel-url
+        default: upstream-s3
+      torch-index-url:
+        description: Index used when torch-source is therock-nightly.
+        type: string
+        default: https://rocm.nightlies.amd.com/v2/gfx950-dcgpu/
+      torch-wheel-url:
+        description: Direct .whl URL when torch-source is wheel-url.
+        type: string
+        default: ""
+      artifact-name:
+        description: Artifact name for gha-artifact and upstream-s3.
+        type: string
+        default: linux-noble-rocm-py3.12-mi350
+      upstream-run-id:
+        description: pytorch/pytorch Actions run id for upstream-s3. Empty = newest sandbox zip that exists.
+        type: string
+        default: ""
+      test-mode:
+        description: How much of the suite to run.
+        type: choice
+        options:
+          - smoke
+          - subset
+          - full
+        default: smoke
+      subset-tests:
+        description: Space-separated run_test.py --include targets for subset mode.
+        type: string
+        default: test_nn test_torch
+      build-environment:
+        description: Must contain "rocm"; drives the ROCm branches in .ci/pytorch/test.sh.
+        type: string
+        default: linux-noble-rocm-py3.12-mi350
+      test-config:
+        description: TEST_CONFIG for full mode (default, inductor, ...).
+        type: string
+        default: default
+      shard:
+        description: Shard number for full mode.
+        type: number
+        default: 1
+      num-shards:
+        description: Total shards for full mode. 8 matches trunk-rocm-sandbox.
+        type: number
+        default: 8
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # The therock-nightly wheel lags this checkout by months, so test/run_test.py
+  # imports internals the wheel does not have. Building here keeps the wheel and
+  # the source tree on the same commit, which is what the dind CI gets from
+  # _linux-build.yml (that workflow is pytorch-org only and cannot run on a fork).
+  build:
+    name: rocm-nodind build
+    if: inputs.torch-source == 'gha-artifact'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 420
+    env:
+      BUILD_ENVIRONMENT: ${{ inputs.build-environment }}
+      USE_ROCM: 1
+      PYTORCH_ROCM_ARCH: gfx950
+      BUILD_TEST: 0
+      USE_KINETO: 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup ROCm without Docker
+        uses: ./.github/actions/setup-rocm-no-dind
+        with:
+          python-version: "3.12"
+          rocm-version: "7.14"
+
+      - name: Install build requirements
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pip install -r requirements-build.txt
+          pip install -r requirements.txt
+
+      - name: Hipify sources
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python tools/amd_build/build_amd.py
+
+      - name: Build wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export MAX_JOBS="$(( $(nproc) - 2 ))"
+          export CMAKE_PREFIX_PATH="${ROCM_PATH}:${CMAKE_PREFIX_PATH:-}"
+          python setup.py bdist_wheel
+
+      - name: Archive artifacts into zip
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # test.sh wants build/lib and build/bin too; they are absent when
+          # BUILD_TEST=0, so only archive what this build actually produced.
+          paths=(dist/)
+          for p in build/lib build/bin .additional_ci_files; do
+            if [[ -e "${p}" ]]; then
+              paths+=("${p}")
+            fi
+          done
+          zip -1 -r artifacts.zip "${paths[@]}"
+
+      - name: Store build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: artifacts.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  test:
+    name: rocm-nodind (${{ inputs.test-mode }})
+    needs: build
+    if: always() && (inputs.torch-source != 'gha-artifact' || needs.build.result == 'success')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 300
+    env:
+      BUILD_ENVIRONMENT: ${{ inputs.build-environment }}
+      PYTORCH_TEST_WITH_ROCM: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Verify no-dind GPU pod
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+            echo "::error::Docker daemon reachable; expected a no-dind runner."
+            exit 1
+          fi
+          test -e /dev/kfd || { echo "::error::/dev/kfd missing"; exit 1; }
+          test -d /dev/dri || { echo "::error::/dev/dri missing"; exit 1; }
+
+      - name: Setup ROCm without Docker
+        uses: ./.github/actions/setup-rocm-no-dind
+        with:
+          python-version: "3.12"
+          rocm-version: "7.14"
+
+      - name: Report GPU and ROCm versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -c "import sys; print('python', sys.version)"
+          rocm-sdk version || true
+          rocminfo | grep -E 'Name:.*\sgfx|Marketing' || true
+
+      - name: Download build artifact
+        if: inputs.torch-source == 'gha-artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+
+      - name: Download upstream CI artifact
+        id: upstream
+        if: inputs.torch-source == 'upstream-s3'
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          UPSTREAM_RUN_ID: ${{ inputs.upstream-run-id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          s3_url() {
+            echo "https://gha-artifacts.s3.amazonaws.com/pytorch/pytorch/${1}/${ARTIFACT_NAME}/artifacts.zip"
+          }
+          zip_exists() {
+            curl -fsI --retry 3 --retry-delay 2 "$(s3_url "${1}")" >/dev/null
+          }
+          github_get() {
+            curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          run_id="${UPSTREAM_RUN_ID}"
+          if [[ -z "${run_id}" ]]; then
+            github_get \
+              "https://api.github.com/repos/pytorch/pytorch/actions/workflows/trunk-rocm-sandbox.yml/runs?per_page=20" \
+              | python -c 'import json,sys; [print(r["id"]) for r in json.load(sys.stdin)["workflow_runs"]]' \
+              > /tmp/upstream-runs.txt
+            while read -r candidate; do
+              if zip_exists "${candidate}"; then
+                run_id="${candidate}"
+                break
+              fi
+            done < /tmp/upstream-runs.txt
+          fi
+          if [[ -z "${run_id}" ]]; then
+            echo "::error::No public ${ARTIFACT_NAME} zip found on recent trunk-rocm-sandbox runs."
+            exit 1
+          fi
+          if ! zip_exists "${run_id}"; then
+            echo "::error::No zip at $(s3_url "${run_id}")"
+            exit 1
+          fi
+
+          echo "Using upstream run ${run_id}"
+          github_get "https://api.github.com/repos/pytorch/pytorch/actions/runs/${run_id}" > /tmp/upstream-run.json
+          python -c 'import json; r=json.load(open("/tmp/upstream-run.json")); print("head_sha", r.get("head_sha"), "created", r.get("created_at"), "conclusion", r.get("conclusion") or r.get("status"))'
+          head_sha="$(python -c 'import json; print(json.load(open("/tmp/upstream-run.json"))["head_sha"])')"
+          echo "head-sha=${head_sha}" >> "${GITHUB_OUTPUT}"
+          curl -fL --retry 5 --retry-delay 5 -o artifacts.zip "$(s3_url "${run_id}")"
+
+      # The wheel is compiled against upstream's tree, so test/ and .ci/ must come
+      # from the same commit: a stale checkout fails on imports that moved.
+      - name: Check out the commit the wheel was built from
+        if: inputs.torch-source == 'upstream-s3'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.upstream.outputs.head-sha }}
+        run: |
+          set -euxo pipefail
+          git fetch --depth 1 https://github.com/pytorch/pytorch.git "${HEAD_SHA}"
+          git checkout --detach FETCH_HEAD
+          git log -1 --oneline
+
+      - name: Install rocm-origami
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pip install "rocm-origami==$(cat .ci/docker/ci_commit_pins/rocm-origami.txt)"
+
+      - name: Install torch
+        shell: bash
+        env:
+          TORCH_SOURCE: ${{ inputs.torch-source }}
+          TORCH_INDEX_URL: ${{ inputs.torch-index-url }}
+          TORCH_WHEEL_URL: ${{ inputs.torch-wheel-url }}
+        run: |
+          set -euxo pipefail
+          case "${TORCH_SOURCE}" in
+            therock-nightly)
+              pip install --index-url "${TORCH_INDEX_URL}" --pre torch
+              ;;
+            wheel-url)
+              test -n "${TORCH_WHEEL_URL}"
+              pip install "${TORCH_WHEEL_URL}"
+              ;;
+            gha-artifact|upstream-s3)
+              unzip -o artifacts.zip
+              rm -f artifacts.zip
+              ls -l dist/*.whl
+              pip install dist/*.whl
+              ;;
+            *)
+              echo "::error::Unknown torch-source ${TORCH_SOURCE}"
+              exit 1
+              ;;
+          esac
+
+      - name: Smoke check
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Run outside the checkout: ./torch would shadow the installed wheel.
+          cd "${RUNNER_TEMP}"
+          python -c "
+          import torch
+          print('torch', torch.__version__)
+          print('hip', torch.version.hip)
+          assert torch.cuda.is_available(), 'no ROCm device visible to torch'
+          print('device', torch.cuda.get_device_name(0))
+          print((torch.randn(1024, 1024, device='cuda') @ torch.randn(1024, 1024, device='cuda')).sum().item())
+          "
+
+      - name: Run subset
+        if: inputs.test-mode == 'subset'
+        shell: bash
+        env:
+          INCLUDE_TESTS: ${{ inputs.subset-tests }}
+        run: |
+          set -euxo pipefail
+          export PYTORCH_TESTING_DEVICE_ONLY_FOR=cuda
+          # Check the status explicitly: a run that died on an import error has
+          # been reported as a green step, which would hide real regressions.
+          rc=0
+          # shellcheck disable=SC2086
+          python test/run_test.py --include ${INCLUDE_TESTS} --verbose || rc=$?
+          if [[ "${rc}" -ne 0 ]]; then
+            echo "::error::run_test.py exited with ${rc}"
+            exit "${rc}"
+          fi
+
+      # Same GPU workload trunk-rocm-sandbox runs for a shard, minus the
+      # pytorch-org plumbing (target determination, monitoring, S3 uploads).
+      - name: Run full shard
+        if: inputs.test-mode == 'full'
+        shell: bash
+        env:
+          TEST_CONFIG: ${{ inputs.test-config }}
+          SHARD_NUMBER: ${{ inputs.shard }}
+          NUM_TEST_SHARDS: ${{ inputs.num-shards }}
+          PR_NUMBER: ""
+          BRANCH: ${{ github.ref_name }}
+          SHA1: ${{ github.sha }}
+          CONTINUE_THROUGH_ERROR: "true"
+        run: |
+          set -euxo pipefail
+          # test.sh runs the C++ suites out of build/bin and reads shard timings
+          # from .additional_ci_files; both ride along in artifacts.zip.
+          ls -d build/bin .additional_ci_files 2>/dev/null || true
+          rc=0
+          .ci/pytorch/test.sh || rc=$?
+          if [[ "${rc}" -ne 0 ]]; then
+            echo "::error::test.sh exited with ${rc}"
+            exit "${rc}"
+          fi
+
+      - name: Collect coredumps
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          for core in core.* /var/lib/systemd/coredump/*; do
+            echo "=== ${core} ==="
+            gdb -batch -ex "bt" python "${core}" 2>/dev/null || true
+          done
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ inputs.test-mode }}-${{ inputs.shard }}
+          path: |
+            test/test-reports/**
+            test/**/*.xml
+          if-no-files-found: ignore
+          retention-days: 7
