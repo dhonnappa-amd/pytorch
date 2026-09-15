@@ -1,0 +1,225 @@
+# Owner(s): ["module: rocm"]
+#
+# Fork-only proof that ARC kubernetes mode can run GHA `container:` jobs
+# without DinD. Do not call pytorch/pytorch reusable workflows (they no-op
+# unless github.repository_owner == 'pytorch').
+#
+# Requires the fork scale set:
+#   linux.rocm.gpu.gfx950.1-dhonnappa-no-dind
+# with containerMode.type=kubernetes and a hook template that puts
+# amd.com/gpu on `$job`. The runner image is the stock Actions runner;
+# this workflow's container.image is the public CI env.
+#
+# Start with mode=smoke. container.options is ignored in kubernetes mode.
+name: rocm-k8s-container
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: smoke = GPU in the job container; build-and-test = compile + shard 1
+        type: choice
+        options:
+          - smoke
+          - build-and-test
+        default: smoke
+      runner:
+        description: Fork ARC runner label
+        type: string
+        default: linux.rocm.gpu.gfx950.1-dhonnappa-no-dind
+      container-image:
+        description: Job container (GHCR mirror of the ubuntu-rocm CI image)
+        type: string
+        default: ghcr.io/pytorch/ci-image:pytorch-linux-noble-rocm-n-py3
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  smoke:
+    name: k8s-container smoke
+    if: inputs.mode == 'smoke' || inputs.mode == 'build-and-test'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    container:
+      image: ${{ inputs.container-image }}
+    steps:
+      - name: Prove job container has the GPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "user=$(whoami) pwd=$(pwd)"
+          echo "python=$(command -v python || true)"
+          test -e /dev/kfd || { echo "::error::/dev/kfd missing in job container"; exit 1; }
+          test -d /dev/dri || { echo "::error::/dev/dri missing in job container"; exit 1; }
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "::error::Docker daemon reachable; kubernetes mode should not use DinD."
+            exit 1
+          fi
+          rocminfo | grep -E 'Name:.*\sgfx|Marketing' || rocminfo | head -n 80
+
+  build:
+    name: k8s-container build
+    if: inputs.mode == 'build-and-test'
+    needs: smoke
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 420
+    container:
+      image: ${{ inputs.container-image }}
+    env:
+      BUILD_ENVIRONMENT: linux-noble-rocm-py3.12-mi350
+      USE_ROCM: 1
+      PYTORCH_ROCM_ARCH: gfx950
+      BUILD_TEST: 0
+      SKIP_SCCACHE_INITIALIZATION: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Workspace writable
+        shell: bash
+        run: chmod -R a+rwX "${GITHUB_WORKSPACE}" || true
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # nproc reports the node's 192 cores, not this pod's cgroup quota, so
+          # the usual `nproc - 2` runs 188 compiles inside an 18-CPU cgroup.
+          cpus=""
+          if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+            read -r quota period < /sys/fs/cgroup/cpu.max
+            if [[ "${quota}" != "max" ]]; then
+              cpus=$(( quota / period ))
+            fi
+          elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then
+            quota="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+            period="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+            if [[ "${quota}" -gt 0 ]]; then
+              cpus=$(( quota / period ))
+            fi
+          fi
+          if [[ -z "${cpus}" || "${cpus}" -lt 1 ]]; then
+            cpus="$(nproc)"
+          fi
+          export MAX_JOBS="$(( cpus > 2 ? cpus - 2 : 1 ))"
+          # sccache 0.16 dies on the CK GEMM kernels ("Failed to parse included
+          # file path"). Its cache is local to the job container, so an
+          # ephemeral pod always starts cold -- 1 hit in 3402 requests -- and it
+          # buys nothing here. build.sh and CMakeLists.txt both wire up the
+          # compiler launchers only when they can find sccache on PATH.
+          new_path=""
+          IFS=':' read -r -a path_parts <<< "${PATH}"
+          for p in "${path_parts[@]}"; do
+            if [[ "${p}" != "/opt/cache/bin" ]]; then
+              new_path="${new_path:+${new_path}:}${p}"
+            fi
+          done
+          export PATH="${new_path}"
+          # Fail loudly rather than silently caching again if the image moves it.
+          if command -v sccache >/dev/null; then
+            echo "sccache still on PATH at $(command -v sccache)" >&2
+            exit 1
+          fi
+          # build.sh sets BUILD_STATIC_RUNTIME_BENCHMARK=ON for every non-cuda
+          # BUILD_ENVIRONMENT. Official linux-build also has BUILD_TEST=1, which
+          # pulls in third_party/benchmark. This PoC sets BUILD_TEST=0, so CMake
+          # still adds static_runtime_bench/test and they fail with
+          # "benchmark/benchmark.h: No such file or directory" (and missing
+          # gtest). Flip the flag in the checked-out copy; do not commit it.
+          sed -i 's/export BUILD_STATIC_RUNTIME_BENCHMARK=ON/export BUILD_STATIC_RUNTIME_BENCHMARK=OFF/' .ci/pytorch/build.sh
+          grep -q 'BUILD_STATIC_RUNTIME_BENCHMARK=OFF' .ci/pytorch/build.sh
+          .ci/pytorch/build.sh
+
+      - name: Archive artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          paths=(dist/)
+          for p in build/lib build/bin .additional_ci_files; do
+            if [[ -e "${p}" ]]; then
+              paths+=("${p}")
+            fi
+          done
+          zip -1 -r artifacts.zip "${paths[@]}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-noble-rocm-py3.12-mi350
+          path: artifacts.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  test:
+    name: k8s-container test
+    if: inputs.mode == 'build-and-test'
+    needs: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 300
+    container:
+      image: ${{ inputs.container-image }}
+    env:
+      BUILD_ENVIRONMENT: linux-noble-rocm-py3.12-mi350
+      PYTORCH_TEST_WITH_ROCM: 1
+      TEST_CONFIG: default
+      SHARD_NUMBER: 1
+      NUM_TEST_SHARDS: 8
+      CONTINUE_THROUGH_ERROR: "true"
+      PR_NUMBER: ""
+      BRANCH: ${{ github.ref_name }}
+      SHA1: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Workspace writable
+        shell: bash
+        run: chmod -R a+rwX "${GITHUB_WORKSPACE}" || true
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-noble-rocm-py3.12-mi350
+
+      - name: Install wheel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          unzip -o artifacts.zip
+          pip install dist/*.whl
+
+      - name: Torch GPU smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP:-/tmp}"
+          python -c "
+          import torch
+          print('torch', torch.__version__)
+          print('hip', torch.version.hip)
+          assert torch.cuda.is_available(), 'no ROCm device visible to torch'
+          print('device', torch.cuda.get_device_name(0))
+          "
+
+      - name: Run shard
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rc=0
+          .ci/pytorch/test.sh || rc=$?
+          if [[ "${rc}" -ne 0 ]]; then
+            echo "::error::test.sh exited with ${rc}"
+            exit "${rc}"
+          fi
